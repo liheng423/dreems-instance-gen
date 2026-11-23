@@ -50,6 +50,7 @@ SFBS_OUTPUT_FIELDS = tuple(name for name in REQUEST_OUTPUT_FIELDS
                            if name not in ("originnode_drive", "destinationnode_drive"))
 DAR_OUTPUT_FIELDS = tuple(name for name in REQUEST_OUTPUT_FIELDS
                            if not name.startswith(("boarding_", "alighting_")))
+HUB_OUTPUT_FIELDS = DAR_OUTPUT_FIELDS + ("train_departure", "transfer_buffer", "hub_node")
 
 
 def busline_dir(route_short_name, buslines_dir=BUSLINES_DIR):

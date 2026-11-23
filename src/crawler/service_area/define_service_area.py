@@ -121,6 +121,7 @@ def save_area(geometry, out_dir, service_geometry=None):
             if overpass_url == OVERPASS_URLS[-1]:
                 raise
             print(f"Overpass request failed at {overpass_url}: {error}; trying another server", flush=True)
+    graphs["drive"] = ox.truncate.largest_component(graphs["drive"], strongly=True)
     pois = crawl_pois(service, tags)
     write_area(mapping(service), graphs, out_dir)
     write_json(graph_path("pois", out_dir), {"features": pois})

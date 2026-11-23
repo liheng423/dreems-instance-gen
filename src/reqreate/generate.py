@@ -30,9 +30,11 @@ from filters.route_schedule import index_route_departures
 from maps.pois import load_pois, set_poi_zones
 from adapters.pool_output import write_pool
 from src.reqreate.operation.energy import consumption_kwh_per_km
-from src.output_adapters import (DAR_OUTPUT_FIELDS, GRAPH_FILES, SFBS_OUTPUT_FIELDS,
+from src.output_adapters import (DAR_OUTPUT_FIELDS, GRAPH_FILES, HUB_OUTPUT_FIELDS, SFBS_OUTPUT_FIELDS,
                                  available_buslines, available_graphs, busline_dir,
                                  busline_path, create_request_dir, graph_dir, graph_path)
+from shapely.geometry import Point
+from src.reqreate.utils.graph_utils import GraphNodeIndex
 
 
 CFG_PATH = ROOT / "src/reqreate/request_gen.toml"
@@ -118,6 +120,85 @@ def sample_arrivals(cfg):
     )).astype(int)
     return prebooked, times
 
+def sample_hub_trips(cfg):
+    """Sample pre-booked/on-demand flags and the train each request connects to."""
+    rng = np.random.default_rng(cfg["seed"])
+    hub = cfg["hub"]
+    prebooked_count = int(rng.poisson(hub["prebooked_mean"]))
+    dynamic_count = int(rng.poisson(hub["dynamic_mean"]))
+    prebooked = np.array([True] * prebooked_count + [False] * dynamic_count, dtype=bool)
+    rng.shuffle(prebooked)
+    trains = hub["timetable"]["trains"]
+    departures = np.array([clock_seconds(train["dep"]) for train in trains], dtype=int)
+    weights = np.array([train["weight"] for train in trains], dtype=float)
+    if weights.min() < 0 or weights.sum() <= 0:
+        raise ValueError("train weights must be nonnegative with a positive sum")
+    train_departures = rng.choice(departures, size=len(prebooked), p=weights / weights.sum())
+    return prebooked, train_departures
+
+def hub_origin_candidates(cfg, net):
+    """Snap the hub and list drive nodes that may serve as trip origins."""
+    hub_cfg = cfg["hub"]
+    hub = GraphNodeIndex(net.G_drive).nearest(hub_cfg["lat"], hub_cfg["lon"])["node_id"]
+    dist_to_hub = nx.single_source_dijkstra_path_length(
+        net.G_drive.reverse(copy=False), hub, weight="length")
+    min_distance_m = next(param["value"] for param in cfg["parameters"]
+                          if param["name"] == "min_distance")
+    candidates = [node for node, dist in dist_to_hub.items()
+                  if dist >= min_distance_m
+                  and net.polygon.contains(Point(net.G_drive.nodes[node]["x"],
+                                                 net.G_drive.nodes[node]["y"]))]
+    if not candidates:
+        raise ValueError("no drive node lies in the service area beyond min_distance from the hub")
+    return hub, candidates, dist_to_hub
+
+def generate_hub_candidates(cfg, net):
+    """Build hub-bound requests whose times run backward from the chosen train."""
+    hub_cfg = cfg["hub"]
+    distributions = cfg["distributions"]
+    prebooked_flags, train_departures = sample_hub_trips(cfg)
+    hub, candidates, dist_to_hub = hub_origin_candidates(cfg, net)
+    hub_point = [net.G_drive.nodes[hub]["y"], net.G_drive.nodes[hub]["x"]]
+    rng = np.random.default_rng(cfg["seed"] + 1)
+    random.seed(cfg["seed"])  # sample_duration draws from the random module
+    reqs = {}
+    for req_idx, (prebooked, train) in enumerate(zip(prebooked_flags, train_departures)):
+        origin = candidates[int(rng.integers(len(candidates)))]
+        direct_distance = float(dist_to_hub[origin])
+        direct_travel_time = int(direct_distance / cfg["vehicle_speed_mps"])
+        service_time = sample_duration(distributions["service_time"])
+        pickup_window = sample_duration(distributions["pickup_timewindow"])
+        dropoff_window = sample_duration(distributions["dropoff_timewindow"])
+        lead = distributions["lt_prebooked" if prebooked else "lt_dynamic"]
+        lead_time = int(rng.uniform(lead["loc"], lead["loc"] + lead["scale"]))
+        deadline = int(train) - hub_cfg["transfer_buffer_s"]
+        max_ride_time = ceil(direct_travel_time * cfg["detour_factor"])
+        pickup_latest = deadline - max_ride_time - service_time
+        pickup_earliest = pickup_latest - pickup_window
+        reqs[str(req_idx)] = {
+            "reqid": req_idx,
+            "is_prebooked": int(prebooked),
+            "lead_time": lead_time,
+            "order_place_time": pickup_earliest - lead_time,
+            "earliest_departure": pickup_earliest,
+            "latest_arrival": deadline,
+            "pickup_earliest": pickup_earliest,
+            "pickup_latest": pickup_latest,
+            "dropoff_earliest": deadline - dropoff_window,
+            "dropoff_latest": deadline,
+            "service_time": service_time,
+            "origin": [net.G_drive.nodes[origin]["y"], net.G_drive.nodes[origin]["x"]],
+            "destination": hub_point,
+            "originnode_drive": origin,
+            "destinationnode_drive": hub,
+            "direct_distance": direct_distance,
+            "direct_travel_time": direct_travel_time,
+            "train_departure": int(train),
+            "transfer_buffer": hub_cfg["transfer_buffer_s"],
+            "hub_node": hub,
+        }
+    cfg["generated_candidate_count"] = len(reqs)
+    return reqs
 
 def sample_duration(distribution):
     """Sample a nonnegative whole-second duration from a uniform setting."""
@@ -163,12 +244,12 @@ def enabled_filters(available, switches):
 
 def load_config(task, busline_name=None):
     """Load the selected task's demand, operation, and filter settings."""
-    if task not in ("DAR", "SFBS"):
+    if task not in ("DAR", "SFBS","HUB"):
         raise ValueError("task must be DAR or SFBS")
     if task == "SFBS" and not busline_name:
         raise ValueError("SFBS requires --busline")
-    if task == "DAR" and busline_name:
-        raise ValueError("DAR does not use --busline")
+    if task in ("DAR", "HUB") and busline_name:
+        raise ValueError("DAR and HUB do not use --busline")
     cfg = tomllib.loads(CFG_PATH.read_text(encoding="utf-8"))
     if not isinstance(cfg.get("retry_if_filtered", False), bool):
         raise ValueError("retry_if_filtered must be true or false")
@@ -191,7 +272,7 @@ def load_config(task, busline_name=None):
     if task == "SFBS":
         route_dir = busline_dir(busline_name)
         cfg["places"] = json.loads(busline_path("stops", route_dir).read_text(encoding="utf-8"))
-    times = cfg["simulation"]
+    times = cfg["hub"]["simulation"] if task == "HUB" else cfg["simulation"]
     start_s = clock_seconds(times["start"])
     end_s = clock_seconds(times["end"])
     demand_start_s = clock_seconds(times["demand_start"])
@@ -203,9 +284,13 @@ def load_config(task, busline_name=None):
     cfg["simulation_end_s"] = end_s
     cfg["demand_start_s"] = demand_start_s
     distributions = cfg["distributions"]
-    expected_dynamic = expected_events(distributions["dynamic_order_place_time"], start_s, end_s)
-    expected_prebooked = expected_events(distributions["prebooked_earliest_departure"],
-                                         demand_start_s, end_s)
+    if task == "HUB":
+        expected_dynamic = cfg["hub"]["dynamic_mean"]
+        expected_prebooked = cfg["hub"]["prebooked_mean"]
+    else:
+        expected_dynamic = expected_events(distributions["dynamic_order_place_time"], start_s, end_s)
+        expected_prebooked = expected_events(distributions["prebooked_earliest_departure"],
+                                             demand_start_s, end_s)
     cfg["requests"] = expected_dynamic + expected_prebooked
     cfg["prebooked_probability"] = (expected_prebooked / cfg["requests"]
                                     if cfg["requests"] else 0)
@@ -309,13 +394,18 @@ def filter_requests(cfg, net, reqs):
 def generate(cfg, area_path, poi_path):
     """Generate, filter, and annotate requests for the selected service area."""
     net = prepare_network(cfg, area_path, poi_path)
-    reqs = generate_candidates(cfg, net)
-    if not cfg.get("retry_if_filtered", False):
-        reqs = filter_requests(cfg, net, reqs)
+    if cfg["task"] == "HUB":
+        candidates = generate_hub_candidates(cfg, net)
+        reqs = filter_requests(cfg, net, candidates)
+        print(f"Hub filters dropped {len(candidates) - len(reqs)} of {len(candidates)} requests")
+    else:
+        reqs = generate_candidates(cfg, net)
+        if not cfg.get("retry_if_filtered", False):
+            reqs = filter_requests(cfg, net, reqs)
     operation = tomllib.loads(OPERATION_CFG_PATH.read_text(encoding="utf-8"))[cfg["task"].lower()]["attribute"]
     profiles = tomllib.loads(VEHICLE_CFG_PATH.read_text(encoding="utf-8"))["profiles"]
     energy_rate = consumption_kwh_per_km({"scenario": operation, "profiles": profiles})
-    fields = SFBS_OUTPUT_FIELDS if cfg["task"] == "SFBS" else DAR_OUTPUT_FIELDS
+    fields = {"SFBS": SFBS_OUTPUT_FIELDS, "HUB": HUB_OUTPUT_FIELDS}.get(cfg["task"], DAR_OUTPUT_FIELDS)
     for req in reqs.values():
         for role in ("origin", "destination"):
             node = req.get(f"{role}node_drive")
@@ -335,7 +425,7 @@ def main():
     """Generate a DAR or SFBS request instance on the selected map."""
     global DEBUG
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("task", choices=("DAR", "SFBS"))
+    parser.add_argument("task", choices=("DAR", "SFBS", "HUB"))
     parser.add_argument("--map", required=True, help="Saved service-area map name")
     parser.add_argument("--busline", help="Required for SFBS; unavailable for DAR")
     parser.add_argument("--debug", action="store_true", help="Include both sampled lead-time fields")
@@ -343,8 +433,8 @@ def main():
     args = parser.parse_args()
     if args.task == "SFBS" and not args.busline:
         parser.error("SFBS requires --busline")
-    if args.task == "DAR" and args.busline:
-        parser.error("DAR does not use --busline")
+    if args.task in ("DAR", "HUB") and args.busline:
+        parser.error("DAR and HUB do not use --busline")
     DEBUG = args.debug
     graph_names = available_graphs()
     if args.map not in graph_names:
